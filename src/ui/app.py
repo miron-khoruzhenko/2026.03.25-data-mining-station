@@ -14,7 +14,38 @@ from src.modes.crawler import CategoryCrawler
 from src.modes.scraper import DataScraper
 from src.utils.exporter import ExcelExporter
 
-st.set_page_config(page_title="AI Data Miner", page_icon="⛏️", layout="wide")
+st.set_page_config(page_title="Strewen - AI Data Miner", page_icon="⛏️", layout="wide")
+# ================= ЭКРАН АВТОРИЗАЦИИ =================
+def check_password():
+    """Возвращает True, если введен правильный пароль."""
+    
+    # Сюда впиши свой надежный пароль
+    CORRECT_PASSWORD = "135531"
+
+    def password_entered():
+        if st.session_state["password"] == CORRECT_PASSWORD:
+            st.session_state["password_correct"] = True
+            # Удаляем пароль из состояния из соображений безопасности
+            del st.session_state["password"]  
+        else:
+            st.session_state["password_correct"] = False
+
+    if "password_correct" not in st.session_state:
+        # Первый запуск, показываем поле ввода
+        st.text_input("Введите пароль для доступа к Data Miner:", type="password", on_change=password_entered, key="password")
+        return False
+    elif not st.session_state["password_correct"]:
+        # Пароль введен неверно, показываем ошибку
+        st.text_input("Введите пароль для доступа к Data Miner:", type="password", on_change=password_entered, key="password")
+        st.error("В доступе отказано. Неверный пароль.")
+        return False
+    
+    # Пароль верен
+    return True
+
+# Останавливаем выполнение всего скрипта, если пароль не пройден
+if not check_password():
+    st.stop()
 
 @st.cache_resource
 def get_db():
