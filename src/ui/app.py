@@ -101,14 +101,15 @@ with st.sidebar:
     # === НОВЫЙ БЛОК: РЕЗЕРВНОЕ КОПИРОВАНИЕ И ОЧИСТКА ===
     st.subheader("🗄️ Резервная копия БД")
     
-    # 1. Скачивание .db файла
+    # 1. Безопасное скачивание .db файла (с учетом WAL)
+    db.force_checkpoint() # Принудительно сохраняем кэш перед чтением
     with open(db.db_path, "rb") as f:
         st.download_button(
             label="💾 Скачать всю базу (.db)",
             data=f,
             file_name="mining_state_backup.db",
             mime="application/octet-stream",
-            width='stretch'
+            use_container_width=True
         )
     
     # 2. Загрузка и восстановление
@@ -272,11 +273,19 @@ with tab2:
         
 # === ОБНОВЛЕННАЯ ВКЛАДКА: УПРАВЛЕНИЕ ДАННЫМИ (УДАЛЕНИЕ) ===
 with tab3:
-    st.subheader("Редактирование записей (Scraper Items)")
-    st.info("Поставь галочку в колонке 'Select' и нажми кнопку удаления снизу.")
+    col_t1, col_t2 = st.columns([3, 1])
+    with col_t1:
+        st.subheader("Управление записями (Scraper Items)")
+    with col_t2:
+        # Массовый возврат всех "пустышек" в очередь
+        if st.button("🔄 Вернуть все пустые в очередь", type="secondary", use_container_width=True):
+            db.requeue_all_empty_and_errors()
+            st.success("Все пустые строки снова получили статус 'pending'!")
+            st.rerun()
+
+    st.info("Выбери строки галочками, чтобы удалить их или отправить на повторный парсинг.")
     
     with db.get_connection() as conn:
-        # Увеличили лимит до 5000 (или можешь вообще убрать LIMIT)
         latest_data = pd.read_sql_query(
             "SELECT id, data_url, status, extracted_data FROM scraper_items ORDER BY id DESC LIMIT 5000", 
             conn
@@ -284,7 +293,6 @@ with tab3:
     
     if not latest_data.empty:
         expanded_rows = []
-        # Собираем все возможные ключи из всех JSON, чтобы колонки не терялись
         all_keys = set()
         for _, row in latest_data.iterrows():
             if row['extracted_data']:
@@ -295,7 +303,6 @@ with tab3:
 
         for _, row in latest_data.iterrows():
             base = {'id': row['id'], 'status': row['status'], 'url': row['data_url']}
-            # Инициализируем все колонки пустыми значениями
             for k in all_keys: base[k] = None
             
             if row['extracted_data']:
@@ -314,17 +321,28 @@ with tab3:
             column_config={"Select": st.column_config.CheckboxColumn("Выбрать", default=False)},
             disabled=[col for col in df.columns if col != "Select"],
             use_container_width=True,
-            height=600  # Сделали таблицу высокой
+            height=600
         )
         
         selected_rows = edited_df[edited_df["Select"] == True]
         selected_ids = selected_rows["id"].tolist()
         
         if selected_ids:
-            st.warning(f"Выбрано строк для удаления: {len(selected_ids)}")
-            if st.button("🗑️ Удалить выбранные строки", type="primary"):
-                db.delete_scraper_items(selected_ids)
-                st.success("Строки удалены!")
-                st.rerun()
+            st.warning(f"Выбрано строк: {len(selected_ids)}")
+            col_act1, col_act2 = st.columns(2)
+            
+            with col_act1:
+                # Точечный возврат в очередь
+                if st.button("🔄 Повторить парсинг (Pending)", type="primary", use_container_width=True):
+                    db.requeue_items(selected_ids)
+                    st.success("Строки возвращены в очередь!")
+                    st.rerun()
+                    
+            with col_act2:
+                # Удаление
+                if st.button("🗑️ Удалить навсегда", type="primary", use_container_width=True):
+                    db.delete_scraper_items(selected_ids)
+                    st.success("Строки удалены!")
+                    st.rerun()
     else:
         st.write("База данных пока пуста.")

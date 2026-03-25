@@ -195,12 +195,34 @@ class DBManager:
     def requeue_all_empty_and_errors(self):
         """Массово находит все пустые и ошибочные строки и возвращает их в очередь."""
         with self.get_connection() as conn:
-            # Ищем статусы empty, error, а также done, если внутри почему-то оказался пустой JSON
-            conn.execute("""
-                UPDATE scraper_items 
-                SET status = 'pending' 
-                WHERE status IN ('empty', 'error', 'timeout_empty') 
-                   OR extracted_data IS NULL 
-                   OR extracted_data = '{}'
-            """)
+            # 1. Возвращаем строки с явными ошибками
+            conn.execute("UPDATE scraper_items SET status = 'pending' WHERE status IN ('empty', 'error', 'timeout_empty')")
+            
+            # 2. Ищем "псевдо-успешные" строки (где есть только системные ссылки, а спарсенные данные null)
+            done_items = conn.execute("SELECT id, extracted_data FROM scraper_items WHERE status = 'done' AND extracted_data IS NOT NULL").fetchall()
+            
+            ids_to_requeue = []
+            for item in done_items:
+                try:
+                    data = json.loads(item['extracted_data'])
+                    
+                    # Удаляем системные поля из проверки
+                    data.pop('data_url', None)
+                    data.pop('source_url', None)
+                    
+                    # Если все остальные ключи пустые (None или "") — это "пустышка"
+                    if all(v is None or str(v).strip() == "" or str(v).strip() == "-" for v in data.values()):
+                        ids_to_requeue.append(item['id'])
+                except:
+                    pass
+            
+            # 3. Массово переводим найденные пустышки обратно в pending
+            if ids_to_requeue:
+                # Разбиваем на батчи (SQLite имеет лимит в 999 переменных на запрос)
+                batch_size = 900
+                for i in range(0, len(ids_to_requeue), batch_size):
+                    batch = ids_to_requeue[i:i + batch_size]
+                    placeholders = ','.join('?' * len(batch))
+                    conn.execute(f"UPDATE scraper_items SET status = 'pending' WHERE id IN ({placeholders})", batch)
+            
             conn.commit()
