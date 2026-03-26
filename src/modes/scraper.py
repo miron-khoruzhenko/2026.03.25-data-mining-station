@@ -1,4 +1,4 @@
-import sys, os, json, time, asyncio
+import sys, os, json, time, asyncio, random
 from urllib.parse import urlparse
 try: from streamlit.runtime.scriptrunner import StopException
 except ImportError: pass
@@ -32,7 +32,8 @@ class DataScraper:
         self.start_time, self.max_items = time.time(), max_items
         
         # Запускаем пул из 5 независимых воркеров (вкладок)
-        await asyncio.gather(*[self._worker(i, custom_fields, use_only_custom, ui_callback) for i in range(5)])
+        # await asyncio.gather(*[self._worker(i, custom_fields, use_only_custom, ui_callback) for i in range(5)])
+        await asyncio.gather(*[self._worker(i, custom_fields, use_only_custom, ui_callback) for i in range(3)])
         
         self._log("[~] Закрытие браузера...", ui_callback)
         await self.browser.close()
@@ -50,10 +51,58 @@ class DataScraper:
             self._log(f"[W-{w_id}] Сбор: {target}", ui_callback)
 
             try:
-                await page.goto(target, timeout=60000, wait_until="domcontentloaded")
+                # 1. Сохраняем ответ сервера
+                response = await page.goto(target, timeout=60000, wait_until="domcontentloaded")
+                
+                # 2. Проверяем HTTP-статусы на наличие блокировок WAF
+                if response and response.status in [429, 403, 503]:
+                    self._log(f"[W-{w_id}][🛑] Защита сайта: HTTP {response.status}. Охлаждаем поток на 60 сек...", ui_callback)
+                    # Возвращаем ссылку в очередь, чтобы не потерять ее
+                    await asyncio.to_thread(self.db.update_item_status, i_id, 'pending')
+                    # Усыпляем только этот поток на минуту
+                    await asyncio.sleep(60)
+                    continue
+                    
                 await self.browser.check_captcha_and_pause(page)
             except Exception as e:
                 self._log(f"[W-{w_id}][!] Ошибка: {e}", ui_callback); await asyncio.to_thread(self.db.update_item_status, i_id, 'error'); continue
+
+            selectors = await self._get_selectors(domain, custom_fields, use_only_custom, page)
+            if not selectors: await asyncio.to_thread(self.db.update_item_status, i_id, 'error'); continue
+
+            # SMART POLLING 3.0: Защита от рваного асинхронного рендеринга
+            ext_data = {}
+            prev_filled = -1
+            stable_ticks = 0
+            
+            for _ in range(30):
+                ext_data = await self._extract(page, selectors)
+                filled_count = sum(1 for v in ext_data.values() if v and str(v).strip() not in ("", "-"))
+                
+                if filled_count == len(selectors): break 
+                if filled_count > 0 and filled_count == prev_filled:
+                    stable_ticks += 1
+                    if stable_ticks >= 6: break
+                else: stable_ticks = 0
+                    
+                prev_filled = filled_count
+                await page.wait_for_timeout(250)
+
+            is_empty = prev_filled == 0
+
+            if is_empty:
+                self._log(f"[W-{w_id}][-] Пусто. Скип.", ui_callback); await asyncio.to_thread(self.db.update_item_status, i_id, 'empty')
+            else:
+                ext_data.update({'data_url': target, 'source_url': item['source_url']})
+                await asyncio.to_thread(self.db.update_item_status, i_id, 'done', ext_data)
+                
+            self.items_processed += 1
+            el = int(time.time() - self.start_time)
+            avg = el / self.items_processed if self.items_processed > 0 else 0
+            self._log(f"[W-{w_id}][+] Готово", ui_callback, {"elapsed": el, "eta": int(avg * (self.max_items - self.items_processed if self.max_items else 0))})
+            
+            # 3. Имитация поведения человека (Jitter). Случайная пауза перед следующей ссылкой
+            await asyncio.sleep(random.uniform(2.0, 4.5))
 
             selectors = await self._get_selectors(domain, custom_fields, use_only_custom, page)
             if not selectors: await asyncio.to_thread(self.db.update_item_status, i_id, 'error'); continue
