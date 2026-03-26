@@ -1,15 +1,26 @@
 version: '3.8'
 
 services:
-  data-miner:
+  # Основной интерфейс Streamlit и ядро парсера
+  app:
     build: .
     container_name: ai_miner_bot
     ports:
       - "8501:8501"
     volumes:
-      # КРИТИЧЕСКИ ВАЖНО: прокидываем папку data наружу! 
-      # Иначе при перезапуске контейнера удалится вся база данных и Excel-файлы.
       - ./data:/app/data
       - ./.env:/app/.env
-    # Скрытый механизм стабильности: Docker сам поднимет бота при любых сбоях или ребуте сервера
     restart: unless-stopped
+
+  # Телеграм-бот (работает параллельно)
+  tg_bot:
+    build: .
+    container_name: mining_tg_bot
+    # Запускаем именно файл бота
+    command: python tg_bot.py
+    volumes:
+      - ./data:/app/data
+      - ./.env:/app/.env
+    restart: unless-stopped
+    depends_on:
+      - app
