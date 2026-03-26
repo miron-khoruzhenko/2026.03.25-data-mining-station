@@ -1,7 +1,7 @@
-import sys
-import os
-import time
-from urllib.parse import urljoin
+import sys, os, time, asyncio, random, json
+from urllib.parse import urlparse, urljoin
+try: from streamlit.runtime.scriptrunner import StopException
+except ImportError: pass
 
 # Позволяет запускать файл напрямую из любой директории
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
@@ -15,124 +15,165 @@ class CategoryCrawler:
         self.db = DBManager()
         self.browser = BrowserManager()
         self.ai = AIExtractor()
-        
-    def run(self, max_pages_to_test=None, headless=True):
-        """
-        Основной цикл. Берет категории из базы и обрабатывает их.
-        max_pages_to_test - ограничение страниц для тестирования.
-        """
-        task = self.db.get_pending_category()
+        self.start_time = 0
+
+    def _log(self, msg, ui_callback=None):
+        print(msg)
+        if ui_callback: ui_callback(msg)
+
+    def run(self, max_pages_to_test=None, headless=True, ui_callback=None):
+        """Синхронная обертка для вызова из интерфейса/демона."""
+        try: asyncio.run(self._async_run(max_pages_to_test, headless, ui_callback))
+        except StopException:
+            self._log("\n[🛑] Процесс прерван.", ui_callback); raise
+        except Exception as e: self._log(f"\n[!] Ошибка: {e}", ui_callback)
+
+    async def _async_run(self, max_pages, headless, ui_callback):
+        task = await asyncio.to_thread(self.db.get_pending_category)
         if not task:
-            print("[-] Нет категорий в очереди (crawler_tasks).")
+            self._log("[-] Нет категорий в очереди (crawler_tasks).", ui_callback)
             return
 
-        print(f"[*] Запуск краулера для категории: {task['category_url']}")
-        page = self.browser.start(headless=headless) # Открываем браузер
+        self._log(f"[*] Запуск краулера для категории: {task['category_url']}", ui_callback)
+        await self.browser.start(headless=headless)
+        self.start_time = time.time()
 
         try:
-            self._process_category(task, max_pages_to_test)
+            await self._process_category(task, max_pages, ui_callback)
         finally:
-            self.browser.close()
+            self._log("[~] Закрытие браузера...", ui_callback)
+            await self.browser.close()
 
-    def _process_category(self, task, max_pages_to_test):
+    async def _get_cached_config(self, domain_key):
+        """Извлекает настройки пагинации из общего кэша AI."""
+        def fetch():
+            with self.db.get_connection() as conn:
+                row = conn.execute("SELECT selectors_json FROM ai_configs WHERE domain = ?", (domain_key,)).fetchone()
+                return json.loads(row['selectors_json']) if row else None
+        return await asyncio.to_thread(fetch)
+
+    async def _process_category(self, task, max_pages, ui_callback):
         task_id = task['id']
         base_url = task['category_url']
         current_page = task['current_page']
         url_template = task['url_template']
         
-        # Шаг 1: Если шаблона нет, получаем его через AI на 1-й странице
-        if not url_template:
-            print("[~] Шаблон пагинации не найден. Запрашиваю у AI...")
-            self.browser.page.goto(base_url, timeout=60000)
-            self.browser.check_captcha_and_pause()
-            
-            clean_html = self.browser.get_clean_html()
-            ai_config = self.ai.get_pagination_config(clean_html, base_url)
-            
-            url_template = ai_config.get('url_template')
-            item_selector = ai_config.get('item_selector')
-            
-            if not item_selector:
-                print("[!] AI не смог найти селектор карточек. Пропуск.")
-                self.db.update_category_progress(task_id, current_page, status='error')
-                return
-                
-            print(f"[+] AI вернул шаблон: {url_template}")
-            print(f"[+] AI вернул селектор карточек: {item_selector}")
-            
-            # Сохраняем шаблон в базу, чтобы не дергать AI при крашах
-            self.db.update_category_progress(task_id, current_page, url_template=url_template)
-        else:
-            # Если шаблон уже есть, нам нужен только селектор карточек (можно кэшировать, но для надежности запросим снова или захардкодим для теста)
-            # В рабочей версии селекторы лучше хранить в таблице ai_configs. Здесь для упрощения запросим у AI один раз.
-            print("[~] Восстановление селектора...")
-            self.browser.page.goto(base_url)
-            clean_html = self.browser.get_clean_html()
-            item_selector = self.ai.get_pagination_config(clean_html, base_url).get('item_selector')
+        # Специальный ключ для кэша, чтобы не смешивать селекторы списков и карточек
+        domain_key = "crawler_" + urlparse(base_url).netloc 
 
-        # Шаг 2: Цикл пагинации
+        page = await self.browser.new_page()
+
+        # --- ФАЕРВОЛ: Блокируем скачивание тяжелого мусора ---
+        async def block_aggressively(route):
+            if route.request.resource_type in ["image", "media", "font"]: await route.abort()
+            else: await route.continue_()
+        await page.route("**/*", block_aggressively)
+        # -----------------------------------------------------
+
+        # --- ШАГ 1: ПОЛУЧЕНИЕ НАСТРОЕК (КЭШ ИЛИ AI) ---
+        ai_config = await self._get_cached_config(domain_key)
+        
+        if not ai_config or not url_template:
+            self._log("[~] Настройки пагинации не найдены. Запрашиваю у AI...", ui_callback)
+            try:
+                await page.goto(base_url, timeout=60000, wait_until="domcontentloaded")
+                await self.browser.check_captcha_and_pause(page)
+                
+                clean_html = await self.browser.get_clean_html(page)
+                ai_config = await asyncio.to_thread(self.ai.get_pagination_config, clean_html, base_url)
+                
+                url_template = ai_config.get('url_template')
+                item_selector = ai_config.get('item_selector')
+                
+                if not item_selector:
+                    self._log("[!] AI не смог найти селектор карточек. Пропуск.", ui_callback)
+                    await asyncio.to_thread(self.db.update_category_progress, task_id, current_page, status='error')
+                    return
+                    
+                self._log(f"[+] AI вернул шаблон: {url_template}", ui_callback)
+                self._log(f"[+] AI вернул селектор карточек: {item_selector}", ui_callback)
+                
+                # Сохраняем в кэш БД
+                await asyncio.to_thread(self.db.update_ai_config, domain_key, ai_config)
+                await asyncio.to_thread(self.db.update_category_progress, task_id, current_page, url_template=url_template)
+            except Exception as e:
+                self._log(f"[!] Ошибка AI инициализации: {e}", ui_callback)
+                return
+        else:
+            item_selector = ai_config.get('item_selector')
+            self._log("[~] Настройки пагинации успешно загружены из кэша.", ui_callback)
+
+        # --- ШАГ 2: ЦИКЛ ПАГИНАЦИИ ---
         consecutive_empty_pages = 0
+        start_page = current_page
         
         while True:
-            if max_pages_to_test and current_page > max_pages_to_test:
-                print(f"[-] Достигнут лимит страниц для теста ({max_pages_to_test}).")
+            pages_processed = current_page - start_page
+            if max_pages and pages_processed >= max_pages:
+                self._log(f"[-] Достигнут лимит страниц ({max_pages}).", ui_callback)
                 break
 
-            # Формируем URL текущей страницы
-            if current_page == 1:
-                target_url = base_url
-            else:
-                if url_template:
-                    # Заменяем {page} на номер. Если AI вернул кривой шаблон без {page}, пытаемся приклеить
-                    target_url = url_template.replace('{page}', str(current_page))
-                else:
-                    print("[-] Пагинации нет (шаблон null). Завершаем.")
-                    break
+            target_url = base_url if current_page == 1 else (url_template.replace('{page}', str(current_page)) if url_template else None)
+            
+            if not target_url:
+                self._log("[-] Пагинации нет (шаблон null). Завершаем.", ui_callback)
+                break
 
-            print(f"\n[>] Скрапинг страницы {current_page}: {target_url}")
+            self._log(f"\n[>] Скрапинг страницы {current_page}: {target_url}", ui_callback)
+            
             try:
-                self.browser.page.goto(target_url, timeout=60000)
-                self.browser.check_captcha_and_pause()
+                response = await page.goto(target_url, timeout=60000, wait_until="domcontentloaded")
                 
-                # Даем время на подгрузку динамики (No-JS/JS)
-                self.browser.page.wait_for_timeout(2000) 
+                # ОБХОД ЗАЩИТЫ (WAF)
+                if response and response.status in [429, 403, 503]:
+                    self._log(f"[🛑] Защита сайта: HTTP {response.status}. Охлаждаем поток на 60 сек...", ui_callback)
+                    await asyncio.sleep(60)
+                    continue
+                    
+                await self.browser.check_captcha_and_pause(page)
             except Exception as e:
-                print(f"[!] Ошибка загрузки страницы: {e}")
-                time.sleep(5)
+                self._log(f"[!] Ошибка загрузки страницы: {e}", ui_callback)
+                await asyncio.sleep(5)
                 continue
 
-            # Ищем элементы по селектору от AI
-            elements = self.browser.page.locator(item_selector).all()
+            # --- SMART POLLING (Ожидание стабильности списка) ---
+            found_elements = []
+            for _ in range(20): # Ждем до 5 секунд (20 тактов по 250мс)
+                elements = await page.locator(item_selector).all()
+                if elements:
+                    found_elements = elements
+                    break
+                await page.wait_for_timeout(250)
             
-            if not elements:
-                print("[-] На странице не найдено ссылок. Возможно, это конец списка.")
+            if not found_elements:
+                self._log("[-] На странице не найдено ссылок. Возможно, это конец списка.", ui_callback)
                 consecutive_empty_pages += 1
                 if consecutive_empty_pages >= 2:
-                    print("[+] Пагинация завершена.")
-                    self.db.update_category_progress(task_id, current_page, status='done')
+                    self._log("[+] Пагинация завершена (2 пустые страницы подряд).", ui_callback)
+                    await asyncio.to_thread(self.db.update_category_progress, task_id, current_page, status='done')
                     break
                 current_page += 1
                 continue
                 
             consecutive_empty_pages = 0
             
-            # Извлекаем href и делаем абсолютные ссылки (добавляем домен, если ссылка вида /item/123)
+            # Извлекаем href
             extracted_urls = []
-            for el in elements:
-                href = el.get_attribute('href')
+            for el in found_elements:
+                href = await el.get_attribute('href')
                 if href:
-                    absolute_url = urljoin(base_url, href)
-                    extracted_urls.append(absolute_url)
+                    extracted_urls.append(urljoin(base_url, href))
 
-            # Сохраняем ссылки в базу (Очередь Режима 2). Дубликаты игнорируются автоматически.
-            self.db.add_scraper_items(source_url=target_url, data_urls=extracted_urls)
-            print(f"[+] Собрано ссылок: {len(extracted_urls)}")
+            # Сохраняем в БД (теперь метод возвращает статистику дубликатов)
+            added, skipped = await asyncio.to_thread(self.db.add_scraper_items, target_url, extracted_urls)
+            self._log(f"[+] Собрано: {len(extracted_urls)} (Новых: {added}, Пропущено дубликатов: {skipped})", ui_callback)
             
-            # Сохраняем прогресс (State Management)
+            # Сохраняем прогресс текущей страницы
             current_page += 1
-            self.db.update_category_progress(task_id, current_page, url_template=url_template)
+            await asyncio.to_thread(self.db.update_category_progress, task_id, current_page, url_template=url_template)
             
-            time.sleep(1) # Небольшая пауза между страницами
+            # JITTER (Имитация человека, короткая пауза)
+            await asyncio.sleep(random.uniform(0.2, 0.5))
 
 
 # ==========================================
@@ -140,25 +181,11 @@ class CategoryCrawler:
 # ==========================================
 if __name__ == '__main__':
     print("[-] Запуск тестирования модуля Crawler...")
-    
-    # 1. Создаем тестовую задачу в БД.
-    # Используем quotes.toscrape.com - легальный сайт-песочница для парсеров.
     db = DBManager()
     test_url = "https://quotes.toscrape.com/tag/life/"
     
     print(f"[*] Добавляю тестовый URL в базу: {test_url}")
     db.add_category_task(test_url)
     
-    # 2. Запускаем краулер (ограничиваем 2 страницами, чтобы тест не шел долго)
     crawler = CategoryCrawler()
-    crawler.run(max_pages_to_test=2)
-    
-    # 3. Проверяем результаты
-    print("\n[!] Проверка результатов в базе (scraper_items):")
-    with db.get_connection() as conn:
-        items = conn.execute("SELECT data_url FROM scraper_items LIMIT 5").fetchall()
-        for item in items:
-            print(f"  - {item['data_url']}")
-        
-        count = conn.execute("SELECT COUNT(*) as c FROM scraper_items").fetchone()['c']
-        print(f"\n[+] Всего ссылок сохранено в БД (уникальных): {count}")
+    crawler.run(max_pages_to_test=2, headless=False)

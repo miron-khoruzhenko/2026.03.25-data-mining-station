@@ -1,4 +1,4 @@
-import sys, os, json, time, asyncio, random
+import sys, os, json, time, asyncio, random, requests
 from urllib.parse import urlparse
 try: from streamlit.runtime.scriptrunner import StopException
 except ImportError: pass
@@ -16,7 +16,19 @@ class DataScraper:
         self.ai = AIExtractor()
         self.db.reset_processing_items()
         self.items_processed, self.max_items, self.start_time = 0, 0, 0
+        
+        self.TG_TOKEN = "5835450415:AAFSBoAx4vB0w6BPeM4z8s4rbAyBnMP7Q2o"
+        self.TG_CHAT_ID = "387276184"
 
+    def _send_tg_alert(self, text):
+        """Отправляет тихое push-уведомление через Telegram API"""
+        if not self.TG_TOKEN or not self.TG_CHAT_ID: return
+        url = f"https://api.telegram.org/bot{self.TG_TOKEN}/sendMessage"
+        try:
+            requests.post(url, json={"chat_id": self.TG_CHAT_ID, "text": text, "parse_mode": "HTML"}, timeout=5)
+        except Exception:
+            pass # Игнорируем ошибки сети при отправке
+        
     def _log(self, msg, ui_callback=None, stats=None):
         print(msg)
         if ui_callback: ui_callback(msg, stats)
@@ -32,15 +44,38 @@ class DataScraper:
         await self.browser.start(headless=headless)
         self.start_time, self.max_items = time.time(), max_items
         
-        # Запускаем пул из 5 независимых воркеров (вкладок)
-        # await asyncio.gather(*[self._worker(i, custom_fields, use_only_custom, ui_callback) for i in range(5)])
-        await asyncio.gather(*[self._worker(i, custom_fields, use_only_custom, ui_callback) for i in range(3)])
-        
-        self._log("[~] Закрытие браузера...", ui_callback)
-        await self.browser.close()
+        try:
+            self._send_tg_alert("🚀 <b>Парсер запущен!</b>\nНачал сбор данных...")
+            
+            # Запускаем пул воркеров
+            await asyncio.gather(*[self._worker(i, custom_fields, use_only_custom, ui_callback) for i in range(3)])
+            
+            # Проверяем, пуста ли база после завершения цикла
+            pending_count = await asyncio.to_thread(
+                lambda: self.db.get_connection().execute("SELECT COUNT(*) FROM scraper_items WHERE status = 'pending'").fetchone()[0]
+            )
+            if pending_count == 0:
+                self._send_tg_alert(f"✅ <b>Парсинг успешно завершен!</b>\nОчередь пуста. Обработано за сессию: {self.items_processed} шт.")
+                
+        except Exception as e:
+            self._send_tg_alert(f"❌ <b>Критическая ошибка парсера!</b>\n<code>{str(e)}</code>")
+            raise e
+        finally:
+            self._log("[~] Закрытие браузера...", ui_callback)
+            await self.browser.close()
 
     async def _worker(self, w_id, custom_fields, use_only_custom, ui_callback):
         page = await self.browser.new_page()
+        # --- ФАЕРВОЛ: Блокируем скачивание тяжелого мусора ---
+        async def block_aggressively(route):
+            # Отбрасываем картинки, шрифты и медиа (CSS и JS оставляем, чтобы Angular не сломался)
+            if route.request.resource_type in ["image", "media", "font"]:
+                await route.abort()
+            else:
+                await route.continue_()
+                
+        await page.route("**/*", block_aggressively)
+        # -----------------------------------------------------
         while True:
             # --- 0. ПРОВЕРКА ЛИМИТОВ И ОЧЕРЕДИ ---
             if self.max_items and self.items_processed >= self.max_items: break

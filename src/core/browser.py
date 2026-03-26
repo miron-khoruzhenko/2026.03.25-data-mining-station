@@ -13,10 +13,24 @@ class BrowserManager:
 
     async def start(self, headless=False):
         self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(headless=headless, args=["--disable-blink-features=AutomationControlled", "--no-sandbox", "--disable-infobars"])
-        self.context = await self.browser.new_context(storage_state=str(self.state_file) if self.state_file.exists() else None, viewport={'width': 1920, 'height': 1080})
+        
+        # Специальные флаги для выживания на слабых VPS и в Docker
+        args = [
+            "--disable-blink-features=AutomationControlled", 
+            "--no-sandbox", 
+            "--disable-infobars",
+            "--disable-dev-shm-usage", # КРИТИЧНО для Docker: отключает лимит /dev/shm, предотвращая краши RAM
+            "--disable-gpu",           # Выключает аппаратное ускорение
+            "--disable-software-rasterizer" # Выключает программную отрисовку (экономит CPU)
+        ]
+        
+        self.browser = await self.playwright.chromium.launch(headless=headless, args=args)
+        self.context = await self.browser.new_context(
+            storage_state=str(self.state_file) if self.state_file.exists() else None, 
+            viewport={'width': 1920, 'height': 1080}
+        )
         await self.context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-
+        
     async def new_page(self):
         return await self.context.new_page()
 
