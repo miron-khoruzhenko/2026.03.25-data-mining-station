@@ -1,9 +1,10 @@
 import streamlit as st
 import sys
-import os
+import time
 import json
 import pandas as pd
 from pathlib import Path
+import os 
 
 # Подключение модулей из корня проекта
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -15,37 +16,36 @@ from src.modes.scraper import DataScraper
 from src.utils.exporter import ExcelExporter
 
 st.set_page_config(page_title="Strewen - AI Data Miner", page_icon="⛏️", layout="wide")
+
 # ================= ЭКРАН АВТОРИЗАЦИИ =================
 def check_password():
     """Возвращает True, если введен правильный пароль."""
-    
-    # Сюда впиши свой надежный пароль
     CORRECT_PASSWORD = "135531"
 
-    def password_entered():
-        if st.session_state["password"] == CORRECT_PASSWORD:
-            st.session_state["password_correct"] = True
-            # Удаляем пароль из состояния из соображений безопасности
-            del st.session_state["password"]  
-        else:
-            st.session_state["password_correct"] = False
+    if st.session_state.get("password_correct", False):
+        return True
 
-    if "password_correct" not in st.session_state:
-        # Первый запуск, показываем поле ввода
-        st.text_input("Введите пароль для доступа к Data Miner:", type="password", on_change=password_entered, key="password")
-        return False
-    elif not st.session_state["password_correct"]:
-        # Пароль введен неверно, показываем ошибку
-        st.text_input("Введите пароль для доступа к Data Miner:", type="password", on_change=password_entered, key="password")
-        st.error("В доступе отказано. Неверный пароль.")
-        return False
-    
-    # Пароль верен
-    return True
+    # Центрируем форму ввода пароля
+    col1, col2, col3 = st.columns([1, 1.5, 1])
+    with col2:
+        st.write("<br><br><br>", unsafe_allow_html=True)
+        with st.form("login_form"):
+            st.markdown("<h2 style='text-align: center;'>⛏️ AI Data Miner</h2>", unsafe_allow_html=True)
+            st.markdown("<p style='text-align: center; color: gray;'>Защищенная панель управления</p>", unsafe_allow_html=True)
+            
+            pwd = st.text_input("Пароль", type="password", label_visibility="collapsed", placeholder="Введите пароль...")
+            
+            if st.form_submit_button("Войти в систему", type="primary", width='stretch'):
+                if pwd == CORRECT_PASSWORD:
+                    st.session_state["password_correct"] = True
+                    st.rerun()
+                else:
+                    st.error("❌ Неверный пароль")
+    return False
 
-# Останавливаем выполнение всего скрипта, если пароль не пройден
 if not check_password():
     st.stop()
+# =====================================================
 
 @st.cache_resource
 def get_db():
@@ -60,7 +60,7 @@ def load_stats():
         
         stats = {
             'crawler': {'pending': 0, 'done': 0, 'error': 0},
-            'scraper': {'pending': 0, 'processing': 0, 'done': 0, 'error': 0}
+            'scraper': {'pending': 0, 'processing': 0, 'done': 0, 'error': 0, 'empty': 0}
         }
         for row in tasks:
             stats['crawler'][row['status']] = row['cnt']
@@ -68,6 +68,12 @@ def load_stats():
             stats['scraper'][row['status']] = row['cnt']
             
         return stats
+
+def format_time(seconds):
+    """Форматирует секунды в MM:SS или HH:MM:SS"""
+    m, s = divmod(int(seconds), 60)
+    h, m = divmod(m, 60)
+    return f"{h:02d}:{m:02d}:{s:02d}" if h > 0 else f"{m:02d}:{s:02d}"
 
 # --- UI Layout ---
 
@@ -82,7 +88,7 @@ with col2:
 with col3:
     st.metric("Успешно собрано", stats['scraper']['done'])
 with col4:
-    st.metric("Ошибок", stats['scraper']['error'])
+    st.metric("Пустых/Ошибок", stats['scraper'].get('error', 0) + stats['scraper'].get('empty', 0))
 
 st.divider()
 
@@ -91,20 +97,28 @@ with st.sidebar:
     st.header("⚙️ Управление задачами")
     
     st.subheader("📥 Импорт ссылок")
-    links_input = st.text_area("Вставь ссылки (по одной в строке):", height=100)
-    col_import1, col_import2 = st.columns(2)
-    with col_import1:
-        if st.button("В Категории", width='stretch'):
-            if links_input.strip():
-                links = [line.strip() for line in links_input.split('\n') if line.strip()]
-                for link in links: db.add_category_task(link)
-                st.success(f"Добавлено {len(links)} шт.")
+    
+    # Меняем порядок вкладок: Карточки теперь первые в списке
+    tab_imp_card, tab_imp_cat = st.tabs(["В Карточки", "В Категории"])
+    
+    with tab_imp_card:
+        links_input_card = st.text_area("Ссылки на карточки:", height=100, key="input_card")
+        category_name = st.text_input("Имя категории (для Excel листа):", placeholder="Оставь пустым для 'manual_import'")
+        
+        if st.button("Добавить в Карточки", width='stretch', type="primary", key="btn_card"):
+            if links_input_card.strip():
+                links = [line.strip() for line in links_input_card.split('\n') if line.strip()]
+                save_category = category_name.strip() if category_name.strip() else "manual_import"
+                db.add_scraper_items(source_url=save_category, data_urls=links)
+                st.success(f"Добавлено {len(links)} шт. в '{save_category}'")
                 st.rerun()
-    with col_import2:
-        if st.button("В Карточки", width='stretch', type="primary"):
-            if links_input.strip():
-                links = [line.strip() for line in links_input.split('\n') if line.strip()]
-                db.add_scraper_items(source_url="manual_import", data_urls=links)
+
+    with tab_imp_cat:
+        links_input_cat = st.text_area("Ссылки на списки:", height=100, key="input_cat")
+        if st.button("Добавить в очередь", width='stretch', key="btn_cat"):
+            if links_input_cat.strip():
+                links = [line.strip() for line in links_input_cat.split('\n') if line.strip()]
+                for link in links: db.add_category_task(link)
                 st.success(f"Добавлено {len(links)} шт.")
                 st.rerun()
 
@@ -113,37 +127,61 @@ with st.sidebar:
     st.subheader("Настройки парсинга")
     custom_fields_input = st.text_area("Кастомные поля (через запятую)", value="ofertant_name, ofertant_cif, autoritate_name, autoritate_cif")
     use_only_custom = st.checkbox("Искать ТОЛЬКО кастомные поля", value=True)
-    
-    # НОВЫЙ ЧЕКБОКС
-    is_headless = st.checkbox("Скрытый режим (Headless)", value=True, help="Ускоряет работу, но повышает риск блокировки капчей.")
+    is_headless = st.checkbox("Скрытый режим (Headless)", value=True, help="Ускоряет работу, но повышает риск блокировки.")
     
     st.divider()
     
     st.subheader("💾 Экспорт в Excel")
     export_name = st.text_input("Префикс файла", value="dataset")
-    if st.button("📥 Выгрузить", width='stretch'):
-        exporter = ExcelExporter()
-        path = exporter.export_done_items(export_name)
-        if path: st.success(f"Сохранено: {path.name}")
-        else: st.warning("Нет данных.")
+    
+    if st.button("⚙️ Сгенерировать Excel", use_container_width=True):
+        with st.spinner("Формируем таблицу..."):
+            exporter = ExcelExporter()
+            path = exporter.export_done_items(export_name)
+            if path: 
+                st.session_state['ready_export_path'] = str(path)
+                st.success("Готово! Нажми 'Скачать' ниже.")
+            else: 
+                st.warning("Нет данных для экспорта.")
+                st.session_state['ready_export_path'] = None
+
+    # Проверяем, готов ли файл к скачиванию
+    export_file_path = st.session_state.get('ready_export_path')
+    is_file_ready = bool(export_file_path and os.path.exists(export_file_path))
+
+    # Готовим данные (если файла нет, отдаем пустые байты, чтобы кнопка не сломалась)
+    if is_file_ready:
+        with open(export_file_path, "rb") as f:
+            file_data = f.read()
+        download_name = os.path.basename(export_file_path)
+    else:
+        file_data = b""
+        download_name = "empty.xlsx"
+
+    # Кнопка скачивания видна всегда, но активна только когда есть файл
+    st.download_button(
+        label="⬇️ Скачать на компьютер",
+        data=file_data,
+        file_name=download_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        use_container_width=True,
+        type="primary",
+        disabled=not is_file_ready
+    )
 
     st.divider()
 
-    # === НОВЫЙ БЛОК: РЕЗЕРВНОЕ КОПИРОВАНИЕ И ОЧИСТКА ===
     st.subheader("🗄️ Резервная копия БД")
-    
-    # 1. Безопасное скачивание .db файла (с учетом WAL)
-    db.force_checkpoint() # Принудительно сохраняем кэш перед чтением
+    db.force_checkpoint()
     with open(db.db_path, "rb") as f:
         st.download_button(
             label="💾 Скачать всю базу (.db)",
             data=f,
             file_name="mining_state_backup.db",
             mime="application/octet-stream",
-            use_container_width=True
+            width='stretch'
         )
     
-    # 2. Загрузка и восстановление
     uploaded_db = st.file_uploader("📂 Восстановить базу", type=["db"])
     if uploaded_db is not None:
         if st.button("⚠️ Перезаписать текущую базу", type="primary", width='stretch'):
@@ -152,12 +190,26 @@ with st.sidebar:
             st.success("База успешно восстановлена!")
             st.rerun()
 
-    # 3. Полная очистка
-    if st.button("🗑 Очистить все очереди", width='stretch'):
-        db.clear_all_queues()
-        st.success("Все данные из очередей удалены!")
-        st.rerun()
-    # =====================================================
+    st.divider()
+
+    # Защищенная кнопка очистки
+    if "confirm_clear" not in st.session_state:
+        st.session_state.confirm_clear = False
+
+    if not st.session_state.confirm_clear:
+        if st.button("🗑 Очистить все очереди", width='stretch'):
+            st.session_state.confirm_clear = True
+            st.rerun()
+    else:
+        st.warning("⚠️ Точно удалить все данные? (Кэш AI останется)")
+        col_y, col_n = st.columns(2)
+        if col_y.button("Да, удалить", type="primary", width='stretch'):
+            db.clear_all_queues()
+            st.session_state.confirm_clear = False
+            st.rerun()
+        if col_n.button("Отмена", width='stretch'):
+            st.session_state.confirm_clear = False
+            st.rerun()
 
 
 # --- ОСНОВНАЯ ПАНЕЛЬ ---
@@ -169,54 +221,41 @@ with tab1:
     with col_run1:
         st.subheader("Режим 1: Crawler")
         pages_to_crawl = st.number_input("Страниц пагинации за запуск?", 1, 1000, 5)
-        if st.button("▶️ Запустить Crawler", type="primary", use_container_width=True):
-            
-            # Динамические контейнеры для лайв-апдейта
+        if st.button("▶️ Запустить Crawler", type="primary", width='stretch'):
             st.markdown("### 🔄 Лайв статус работы")
-            live_stats = st.empty()
             live_logs = st.empty()
             log_history = []
 
-            def crawler_callback(msg):
-                log_history.append(msg)
-                live_logs.code("\n".join(log_history[-15:]), language="text") # Храним только 15 последних строк
-                
-                # Перерисовка статистики базы данных
-                s = load_stats()
-                with live_stats.container():
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Очередь Категорий", s['crawler']['pending'])
-                    c2.metric("Очередь Карточек", s['scraper']['pending'])
-                    c3.metric("Успешно собрано", s['scraper']['done'])
-                    c4.metric("Ошибок", s['scraper']['error'])
+            def crawler_callback(msg, stats=None):
+                if msg:
+                    log_history.append(msg)
+                    live_logs.code("\n".join(log_history[-15:]), language="text")
 
-            with st.spinner("Работает... Для экстренной остановки нажми 'Stop' в правом верхнем углу экрана."):
+            with st.spinner("Работает... Для экстренной остановки нажми 'Stop' в правом верхнем углу."):
                 CategoryCrawler().run(max_pages_to_test=pages_to_crawl, headless=is_headless, ui_callback=crawler_callback)
             st.rerun()
 
     with col_run2:
         st.subheader("Режим 2: Scraper")
         items_to_scrape = st.number_input("Карточек за запуск?", 1, 1000, 10)
-        if st.button("▶️ Запустить Scraper", type="primary", use_container_width=True):
+        if st.button("▶️ Запустить Scraper", type="primary", width='stretch'):
             
+            live_timer = st.empty()
             st.markdown("### 🔄 Лайв статус работы")
-            live_stats = st.empty()
             live_logs = st.empty()
             log_history = []
 
-            def scraper_callback(msg):
-                log_history.append(msg)
-                live_logs.code("\n".join(log_history[-15:]), language="json")
-                
-                s = load_stats()
-                with live_stats.container():
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Очередь Категорий", s['crawler']['pending'])
-                    c2.metric("Очередь Карточек", s['scraper']['pending'])
-                    c3.metric("Успешно собрано", s['scraper']['done'])
-                    c4.metric("Ошибок", s['scraper']['error'])
+            def scraper_callback(msg, stats=None):
+                if msg:
+                    log_history.append(msg)
+                    live_logs.code("\n".join(log_history[-15:]), language="json")
+                if stats:
+                    with live_timer.container():
+                        ct1, ct2 = st.columns(2)
+                        ct1.metric("⏱ Прошло времени", format_time(stats['elapsed']))
+                        ct2.metric("⏳ Осталось примерно", format_time(stats['eta']))
 
-            with st.spinner("Работает... Для экстренной остановки нажми 'Stop' в правом верхнем углу экрана."):
+            with st.spinner("Работает... Для экстренной остановки нажми 'Stop' в правом верхнем углу."):
                 custom_fields = [f.strip() for f in custom_fields_input.split(",") if f.strip()]
                 DataScraper().run(
                     custom_fields=custom_fields, 
@@ -240,10 +279,8 @@ with tab2:
             with st.expander(f"🌐 Домен: {domain}", expanded=False):
                 selectors_dict = json.loads(row['selectors_json'])
                 
-                # Создаем две вложенные вкладки внутри экспандера
                 edit_tab1, edit_tab2 = st.tabs(["🗂️ Таблица", "📝 Raw JSON (Код)"])
                 
-                # --- Вкладка 1: Таблица ---
                 with edit_tab1:
                     clean_dict = {k: (v if v is not None else "") for k, v in selectors_dict.items()}
                     df = pd.DataFrame(list(clean_dict.items()), columns=['Поле', 'Селектор'])
@@ -260,7 +297,6 @@ with tab2:
                         new_selectors = {}
                         for _, r in edited_df.iterrows():
                             val = r['Селектор']
-                            # Безопасная проверка на пустые значения, чтобы избежать ошибок
                             if isinstance(val, str) and val.strip() != "":
                                 new_selectors[r['Поле']] = val.strip()
                             else:
@@ -270,9 +306,7 @@ with tab2:
                         st.success("Таблица успешно сохранена!")
                         st.rerun()
                         
-                # --- Вкладка 2: Raw JSON ---
                 with edit_tab2:
-                    # Форматируем JSON с отступами для удобного чтения и редактирования
                     raw_json_str = json.dumps(selectors_dict, indent=4, ensure_ascii=False)
                     edited_json_str = st.text_area(
                         "Редактор JSON", 
@@ -283,17 +317,14 @@ with tab2:
                     
                     if st.button(f"💾 Сохранить JSON", key=f"save_raw_{domain}", type="primary"):
                         try:
-                            # Проверяем, не нарушил ли ты синтаксис (запятые, кавычки)
                             parsed_json = json.loads(edited_json_str)
                             db.update_ai_config(domain, parsed_json)
                             st.success("JSON успешно сохранен!")
                             st.rerun()
                         except json.JSONDecodeError as e:
-                            st.error(f"Ошибка синтаксиса JSON (проверь запятые и кавычки): {e}")
+                            st.error(f"Ошибка синтаксиса JSON: {e}")
 
                 st.divider()
-                
-                # Общая кнопка удаления кэша
                 if st.button(f"🗑️ Удалить кэш домена", key=f"del_cache_{domain}"):
                     db.delete_ai_config(domain)
                     st.rerun()
@@ -301,27 +332,57 @@ with tab2:
         st.write("Кэш селекторов пока пуст.")
         
         
-        
-# === ОБНОВЛЕННАЯ ВКЛАДКА: УПРАВЛЕНИЕ ДАННЫМИ (УДАЛЕНИЕ) ===
+# === ВКЛАДКА УПРАВЛЕНИЯ ДАННЫМИ С ПАГИНАЦИЕЙ ===
 with tab3:
     col_t1, col_t2 = st.columns([3, 1])
     with col_t1:
         st.subheader("Управление записями (Scraper Items)")
     with col_t2:
-        # Массовый возврат всех "пустышек" в очередь
-        if st.button("🔄 Вернуть все пустые в очередь", type="secondary", use_container_width=True):
+        if st.button("🔄 Вернуть все пустые в очередь", type="secondary", width='stretch'):
             db.requeue_all_empty_and_errors()
             st.success("Все пустые строки снова получили статус 'pending'!")
             st.rerun()
 
     st.info("Выбери строки галочками, чтобы удалить их или отправить на повторный парсинг.")
     
+    # --- ЛОГИКА ПАГИНАЦИИ ---
+    ROWS_PER_PAGE = 500
+    
+    if "current_page" not in st.session_state:
+        st.session_state.current_page = 1
+
     with db.get_connection() as conn:
+        # Узнаем общее количество строк
+        total_rows = conn.execute("SELECT COUNT(*) FROM scraper_items").fetchone()[0]
+        total_pages = max(1, (total_rows + ROWS_PER_PAGE - 1) // ROWS_PER_PAGE)
+        
+        # Корректировка страницы, если удалили данные и вышли за пределы
+        if st.session_state.current_page > total_pages:
+            st.session_state.current_page = total_pages
+
+        # Вычисляем сдвиг (OFFSET)
+        offset = (st.session_state.current_page - 1) * ROWS_PER_PAGE
+        
+        # Загружаем только нужный кусок
         latest_data = pd.read_sql_query(
-            "SELECT id, data_url, status, extracted_data FROM scraper_items ORDER BY id DESC LIMIT 5000", 
+            f"SELECT id, data_url, status, extracted_data FROM scraper_items ORDER BY id DESC LIMIT {ROWS_PER_PAGE} OFFSET {offset}", 
             conn
         )
     
+    # --- Отрисовка кнопок пагинации (ВЕРХ) ---
+    col_p1, col_p2, col_p3 = st.columns([1, 2, 1])
+    with col_p1:
+        if st.button("⬅️ Предыдущая", disabled=(st.session_state.current_page == 1), width='stretch'):
+            st.session_state.current_page -= 1
+            st.rerun()
+    with col_p2:
+        st.markdown(f"<div style='text-align: center; margin-top: 8px;'><b>Страница {st.session_state.current_page} из {total_pages}</b> (Всего записей: {total_rows})</div>", unsafe_allow_html=True)
+    with col_p3:
+        if st.button("Следующая ➡️", disabled=(st.session_state.current_page == total_pages), width='stretch'):
+            st.session_state.current_page += 1
+            st.rerun()
+    
+    # --- Отрисовка таблицы ---
     if not latest_data.empty:
         expanded_rows = []
         all_keys = set()
@@ -346,32 +407,36 @@ with tab3:
         df = pd.DataFrame(expanded_rows)
         df.insert(0, "Select", False)
         
+        # Конфигурация специфичных колонок
+        col_config = {
+            "Select": st.column_config.CheckboxColumn("Выбрать", default=False),
+            "url": st.column_config.LinkColumn("Ссылка", display_text="Открыть карточку ↗") 
+        }
+        
         edited_df = st.data_editor(
             df,
             hide_index=True,
-            column_config={"Select": st.column_config.CheckboxColumn("Выбрать", default=False)},
+            column_config=col_config,
             disabled=[col for col in df.columns if col != "Select"],
-            use_container_width=True,
+            width='stretch',
             height=600
         )
-        
+
         selected_rows = edited_df[edited_df["Select"] == True]
         selected_ids = selected_rows["id"].tolist()
         
         if selected_ids:
-            st.warning(f"Выбрано строк: {len(selected_ids)}")
+            st.warning(f"Выбрано строк на этой странице: {len(selected_ids)}")
             col_act1, col_act2 = st.columns(2)
             
             with col_act1:
-                # Точечный возврат в очередь
-                if st.button("🔄 Повторить парсинг (Pending)", type="primary", use_container_width=True):
+                if st.button("🔄 Повторить парсинг (Pending)", type="primary", width='stretch'):
                     db.requeue_items(selected_ids)
                     st.success("Строки возвращены в очередь!")
                     st.rerun()
                     
             with col_act2:
-                # Удаление
-                if st.button("🗑️ Удалить навсегда", type="primary", use_container_width=True):
+                if st.button("🗑️ Удалить навсегда", type="primary", width='stretch'):
                     db.delete_scraper_items(selected_ids)
                     st.success("Строки удалены!")
                     st.rerun()

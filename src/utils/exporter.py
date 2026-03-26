@@ -1,16 +1,13 @@
-import sys
-import os
-import json
 import pandas as pd
-from datetime import datetime
+import json
 from pathlib import Path
-
-# Подключение модулей из корня проекта
-sys.path.append(str(Path(__file__).resolve().parent.parent.parent))
-
-from src.db.db_manager import DBManager
+from datetime import datetime
+import sys
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.append(str(PROJECT_ROOT))
+
+from src.db.db_manager import DBManager
 
 class ExcelExporter:
     def __init__(self):
@@ -19,88 +16,44 @@ class ExcelExporter:
         self.exports_dir.mkdir(parents=True, exist_ok=True)
 
     def export_done_items(self, filename_prefix="export"):
-        """
-        Выгружает все успешно собранные данные (status='done') в Excel.
-        """
-        print("\n[*] Запуск экспорта данных в Excel...")
-        
         with self.db.get_connection() as conn:
-            # Получаем все завершенные задачи
-            rows = conn.execute("SELECT extracted_data FROM scraper_items WHERE status = 'done'").fetchall()
-        
-        if not rows:
-            print("[-] Нет данных для экспорта (нет записей со статусом 'done').")
-            return None
+            df = pd.read_sql_query("SELECT id, data_url, source_url, extracted_data FROM scraper_items WHERE status = 'done'", conn)
 
-        data_list = []
-        for row in rows:
-            raw_json = row['extracted_data']
-            if raw_json:
+        if df.empty: return None
+
+        expanded_rows = []
+        for _, row in df.iterrows():
+            base = {'data_url': row['data_url'], 'category': row['source_url']}
+            if row['extracted_data']:
                 try:
-                    parsed_data = json.loads(raw_json)
-                    data_list.append(parsed_data)
+                    data = json.loads(row['extracted_data'])
+                    base.update(data)
                 except json.JSONDecodeError:
-                    print(f"[!] Ошибка парсинга JSON для строки: {raw_json}")
-                    continue
+                    pass
+            expanded_rows.append(base)
 
-        if not data_list:
-            print("[-] Данные пусты после парсинга.")
-            return None
+        final_df = pd.DataFrame(expanded_rows)
 
-        # Создаем DataFrame (таблицу) из списка словарей
-        df = pd.DataFrame(data_list)
-        
-        # 1. Базовые колонки, которые мы хотим видеть первыми
-        base_columns = [
-            'company_name', 'company_phone', 'company_email', 
-            'company_website', 'company_fax'
-        ]
-        
-        # 2. Системные колонки, которые лучше держать в конце
-        system_columns = ['data_url', 'source_url']
-        
-        # 3. Определяем динамические (кастомные) колонки
-        all_columns = list(df.columns)
+        base_columns = ['company_name', 'company_phone', 'company_email', 'company_website', 'company_fax']
+        system_columns = ['data_url', 'source_url', 'category']
+        all_columns = list(final_df.columns)
         custom_columns = [col for col in all_columns if col not in base_columns and col not in system_columns]
         
-        # Формируем итоговый порядок колонок
-        final_columns = []
-        
-        # Добавляем базовые (только те, что реально есть в данных)
-        for col in base_columns:
-            if col in all_columns:
-                final_columns.append(col)
-        
-        # Вставляем кастомные посередине
+        final_columns = [col for col in base_columns if col in all_columns]
         final_columns.extend(custom_columns)
-        
-        # Вставляем системные в конец
-        for col in system_columns:
-            if col in all_columns:
-                final_columns.append(col)
+        final_columns.extend([col for col in system_columns if col in all_columns])
 
-        # Переставляем колонки в DataFrame
-        df = df[final_columns]
-        
-        # Формируем имя файла с датой и временем
+        final_df = final_df[final_columns]
+
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        filename = f"{filename_prefix}_{timestamp}.xlsx"
-        filepath = self.exports_dir / filename
-        
-        # Сохраняем в Excel
+        filepath = self.exports_dir / f"{filename_prefix}_{timestamp}.xlsx"
+
         try:
-            df.to_excel(filepath, index=False, engine='openpyxl')
-            print(f"[+] Экспорт успешно завершен! Сохранено строк: {len(df)}")
-            print(f"[+] Файл сохранен по пути: {filepath}")
+            with pd.ExcelWriter(filepath, engine='openpyxl') as writer:
+                grouped = final_df.groupby('category')
+                for category_name, group_df in grouped:
+                    safe_sheet_name = str(category_name)[:31].replace('/', '_').replace('\\', '_').replace('?', '_')
+                    group_df.drop(columns=['category']).to_excel(writer, sheet_name=safe_sheet_name, index=False)
             return filepath
-        except Exception as e:
-            print(f"[!] Ошибка при сохранении Excel файла: {e}")
+        except Exception:
             return None
-
-
-# ==========================================
-# БЛОК ИЗОЛИРОВАННОГО ТЕСТИРОВАНИЯ
-# ==========================================
-if __name__ == '__main__':
-    exporter = ExcelExporter()
-    exporter.export_done_items("test_export")

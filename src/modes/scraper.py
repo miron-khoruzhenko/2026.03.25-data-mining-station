@@ -1,12 +1,9 @@
-import sys
-import os
-import json
-import time
+import sys, os, json, time, asyncio
 from urllib.parse import urlparse
+try: from streamlit.runtime.scriptrunner import StopException
+except ImportError: pass
 
-# Подключение модулей из корня проекта
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-
 from src.db.db_manager import DBManager
 from src.core.browser import BrowserManager
 from src.ai.extractor import AIExtractor
@@ -16,184 +13,119 @@ class DataScraper:
         self.db = DBManager()
         self.browser = BrowserManager()
         self.ai = AIExtractor()
-        
-        # Сброс зависших задач при рестарте (защита от крашей)
         self.db.reset_processing_items()
+        self.items_processed, self.max_items, self.start_time = 0, 0, 0
 
-    def _log(self, msg: str, ui_callback=None):
+    def _log(self, msg, ui_callback=None, stats=None):
         print(msg)
-        if ui_callback:
-            ui_callback(msg)
+        if ui_callback: ui_callback(msg, stats)
 
-    def run(self, custom_fields: list = None, max_items_to_test: int = None, use_only_custom: bool = False, headless: bool = True, ui_callback=None):
-        self._log("[*] Запуск экстрактора (Режим 2).", ui_callback)
-        self.browser.start(headless=headless)
-        items_processed = 0
+    def run(self, custom_fields=None, max_items_to_test=None, use_only_custom=False, headless=True, ui_callback=None):
+        try: asyncio.run(self._async_run(custom_fields, max_items_to_test, use_only_custom, headless, ui_callback))
+        except StopException:
+            self._log("\n[🛑] Процесс прерван.", ui_callback); raise
+        except Exception as e: self._log(f"\n[!] Ошибка: {e}", ui_callback)
 
-        try:
-            while True:
-                if max_items_to_test and items_processed >= max_items_to_test:
-                    self._log(f"[-] Достигнут лимит тестирования ({max_items_to_test} шт.). Завершение.", ui_callback)
-                    break
+    async def _async_run(self, custom_fields, max_items, use_only_custom, headless, ui_callback):
+        self._log("[*] Запуск экстрактора (Многопоточный Режим).", ui_callback)
+        await self.browser.start(headless=headless)
+        self.start_time, self.max_items = time.time(), max_items
+        
+        # Запускаем пул из 5 независимых воркеров (вкладок)
+        await asyncio.gather(*[self._worker(i, custom_fields, use_only_custom, ui_callback) for i in range(5)])
+        
+        self._log("[~] Закрытие браузера...", ui_callback)
+        await self.browser.close()
 
-                item = self.db.get_pending_item()
-                if not item:
-                    self._log("[-] Нет ссылок в очереди (status = 'pending'). Завершение работы.", ui_callback)
-                    break
-
-                item_id = item['id']
-                target_url = item['data_url']
-                domain = urlparse(target_url).netloc
-                
-                self._log(f"\n[>] Обработка [{items_processed + 1}]: {target_url}", ui_callback)
-                
-                try:
-                    self.browser.page.goto(target_url, timeout=60000)
-                    self.browser.check_captcha_and_pause()
-                    # Возвращаем надежную базовую паузу
-                    self.browser.page.wait_for_timeout(2000) 
-                except Exception as e:
-                    self._log(f"[!] Ошибка загрузки страницы карточки: {e}", ui_callback)
-                    self.db.update_item_status(item_id, status='error')
-                    continue
-
-                selectors = self._get_selectors_for_domain(domain, custom_fields, use_only_custom, ui_callback)
-                
-                if not selectors:
-                    self._log(f"[!] Не удалось получить селекторы для домена {domain}.", ui_callback)
-                    self.db.update_item_status(item_id, status='error')
-                    continue
-
-                # 1. Первичное извлечение данных
-                extracted_data = self._extract_data_from_page(selectors)
-                
-                # Локальная функция для проверки: пусты ли все собранные поля?
-                def is_data_empty(data):
-                    return all(v is None or str(v).strip() == "" for v in data.values())
-
-                # 2. Если данные пустые, делаем Retry (повторную попытку)
-                if is_data_empty(extracted_data):
-                    self._log("[~] Данные не найдены (возможно, не успел прогрузиться JS). Делаю повторную попытку...", ui_callback)
-                    
-                    try:
-                        self.browser.page.reload()
-                        self.browser.page.wait_for_timeout(4000) # Ждем чуть дольше на втором шансе
-                        extracted_data = self._extract_data_from_page(selectors)
-                    except Exception:
-                        pass # Если релоад упал, просто пойдем дальше
-
-                    # 3. Если данные ВСЁ ЕЩЕ пустые, помечаем строку как empty и пропускаем
-                    if is_data_empty(extracted_data):
-                        self._log("[-] Страница пустая (селекторы ничего не нашли). Пропускаю.", ui_callback)
-                        # Статус 'empty' гарантирует, что Экспортер проигнорирует эту строку
-                        self.db.update_item_status(item_id, status='empty')
-                        items_processed += 1
-                        continue
-
-                # Если мы дошли сюда, значит данные есть. Добавляем системные поля.
-                extracted_data['data_url'] = target_url
-                extracted_data['source_url'] = item['source_url']
-
-                self._log(f"[+] Данные собраны: {json.dumps(extracted_data, ensure_ascii=False)}", ui_callback)
-                
-                # Сохраняем как успешно собранные
-                self.db.update_item_status(item_id, status='done', extracted_data=extracted_data)
-                items_processed += 1
-                
-                time.sleep(1)
-
-        finally:
-            self.browser.close()
+    async def _worker(self, w_id, custom_fields, use_only_custom, ui_callback):
+        page = await self.browser.new_page()
+        while True:
+            if self.max_items and self.items_processed >= self.max_items: break
             
-    def _get_selectors_for_domain(self, domain: str, custom_fields: list, use_only_custom: bool, ui_callback=None) -> dict:
-        """
-        Ищет селекторы в базе. Если их нет, генерирует через AI и кэширует.
-        """
+            item = await asyncio.to_thread(self.db.get_pending_item)
+            if not item: break
+
+            i_id, target = item['id'], item['data_url']
+            domain = urlparse(target).netloc
+            self._log(f"[W-{w_id}] Сбор: {target}", ui_callback)
+
+            try:
+                await page.goto(target, timeout=60000, wait_until="domcontentloaded")
+                await self.browser.check_captcha_and_pause(page)
+            except Exception as e:
+                self._log(f"[W-{w_id}][!] Ошибка: {e}", ui_callback); await asyncio.to_thread(self.db.update_item_status, i_id, 'error'); continue
+
+            selectors = await self._get_selectors(domain, custom_fields, use_only_custom, page)
+            if not selectors: await asyncio.to_thread(self.db.update_item_status, i_id, 'error'); continue
+
+            # SMART POLLING 2.0: Алгоритм ожидания стабильности DOM
+            # SMART POLLING 3.0: Защита от рваного асинхронного рендеринга
+            ext_data = {}
+            prev_filled = -1
+            stable_ticks = 0
+            
+            # Увеличили лимит до 30 тактов (максимум 7.5 секунд на самые тугие страницы)
+            for _ in range(30):
+                ext_data = await self._extract(page, selectors)
+                
+                # Считаем непустые поля
+                filled_count = sum(1 for v in ext_data.values() if v and str(v).strip() not in ("", "-"))
+                
+                # Если 100% полей найдены — идеальный сценарий, мгновенно выходим
+                if filled_count == len(selectors):
+                    break 
+                    
+                # Если хотя бы что-то появилось, и количество не меняется
+                if filled_count > 0 and filled_count == prev_filled:
+                    stable_ticks += 1
+                    # Ждем 1.5 секунды (6 тактов по 250мс) полного отсутствия новых элементов
+                    if stable_ticks >= 6: 
+                        break
+                else:
+                    stable_ticks = 0 # Сброс, если Angular подгрузил новый кусок данных
+                    
+                prev_filled = filled_count
+                await page.wait_for_timeout(250)
+
+            is_empty = prev_filled == 0
+
+            if is_empty:
+                self._log(f"[W-{w_id}][-] Пусто. Скип.", ui_callback); await asyncio.to_thread(self.db.update_item_status, i_id, 'empty')
+            else:
+                ext_data.update({'data_url': target, 'source_url': item['source_url']})
+                await asyncio.to_thread(self.db.update_item_status, i_id, 'done', ext_data)
+                
+            self.items_processed += 1
+            el = int(time.time() - self.start_time)
+            avg = el / self.items_processed if self.items_processed > 0 else 0
+            self._log(f"[W-{w_id}][+] Готово", ui_callback, {"elapsed": el, "eta": int(avg * (self.max_items - self.items_processed if self.max_items else 0))})
+
+    # --- ИСПРАВЛЕННАЯ ЛОГИКА РАБОТЫ С КЭШЕМ ---
+    def _get_cached_selectors(self, domain):
+        """Безопасное извлечение селекторов из БД."""
         with self.db.get_connection() as conn:
             row = conn.execute("SELECT selectors_json FROM ai_configs WHERE domain = ?", (domain,)).fetchone()
-            
-            if row:
-                print("[~] Селекторы найдены в кэше БД.")
-                return json.loads(row['selectors_json'])
-            
-            print("[~] Селекторы для домена не найдены. Запрашиваю анализ у AI...")
-            clean_html = self.browser.get_clean_html()
-            
-            # Запрос к Gemini
-            selectors = self.ai.get_data_selectors(clean_html, custom_fields=custom_fields, use_only_custom=use_only_custom)
-            
-            # Сохраняем в кэш
-            conn.execute(
-                "INSERT INTO ai_configs (domain, selectors_json) VALUES (?, ?)",
-                (domain, json.dumps(selectors))
-            )
-            conn.commit()
-            
-            print("[+] Новые селекторы сгенерированы и сохранены.")
-            return selectors
+            return json.loads(row['selectors_json']) if row else None
 
-    def _extract_data_from_page(self, selectors: dict) -> dict:
-        """
-        Применяет локаторы к текущей странице через Playwright.
-        """
-        result = {}
-        for field_name, selector in selectors.items():
-            if not selector: 
-                result[field_name] = None
-                continue
-                
+    async def _get_selectors(self, domain, c_fields, only_custom, page):
+        selectors = await asyncio.to_thread(self._get_cached_selectors, domain)
+        if selectors: return selectors
+        
+        selectors = await asyncio.to_thread(self.ai.get_data_selectors, await self.browser.get_clean_html(page), c_fields, only_custom)
+        if selectors: await asyncio.to_thread(self.db.update_ai_config, domain, selectors)
+        return selectors
+
+    async def _extract(self, page, selectors):
+        res = {}
+        for f, sel in selectors.items():
+            if not sel: res[f] = None; continue
             try:
-                locator = self.browser.page.locator(selector).first
-                if locator.count() > 0:
-                    # Универсальная проверка: ищем ключевые слова в названии любого кастомного поля
-                    is_link_field = any(kw in field_name.lower() for kw in ['website', 'email', 'url', 'link'])
-                    
-                    # Проверяем, является ли найденный элемент тегом <a>
-                    is_a_tag = locator.evaluate("el => el.tagName.toLowerCase() === 'a'")
-                    
-                    if is_link_field and is_a_tag:
-                        href = locator.get_attribute('href')
-                        if href and href.startswith('mailto:'):
-                            result[field_name] = href.replace('mailto:', '').strip()
-                        else:
-                            # Берем href, но если он пустой (бывает и такое), берем внутренний текст
-                            result[field_name] = href.strip() if href else locator.inner_text().strip()
-                    else:
-                        result[field_name] = locator.inner_text().strip()
-                else:
-                    result[field_name] = None
-            except Exception as e:
-                # print(f"[!] Ошибка извлечения {field_name}: {e}") # Можно раскомментировать для дебага
-                result[field_name] = None
-                
-        return result
-
-
-# ==========================================
-# БЛОК ИЗОЛИРОВАННОГО ТЕСТИРОВАНИЯ
-# ==========================================
-if __name__ == '__main__':
-    print("[-] Запуск тестирования модуля Scraper...")
-    
-    # 1. Сначала добавим фейковую задачу в БД, чтобы было что парсить
-    db = DBManager()
-    test_target_url = "https://quotes.toscrape.com/author/Albert-Einstein/"
-    test_source_url = "https://quotes.toscrape.com/"
-    
-    print(f"[*] Добавляю тестовую карточку (детали автора) в базу: {test_target_url}")
-    db.add_scraper_items(source_url=test_source_url, data_urls=[test_target_url])
-    
-    # 2. Запускаем экстрактор (только 1 элемент)
-    # Запросим кастомные поля, специфичные для этого сайта-песочницы
-    custom_fields_to_find = ['author_born_date', 'author_born_location']
-    
-    scraper = DataScraper()
-    scraper.run(custom_fields=custom_fields_to_find, max_items_to_test=1)
-    
-    # 3. Проверяем результаты
-    print("\n[!] Проверка статуса в базе:")
-    with db.get_connection() as conn:
-        item = conn.execute("SELECT * FROM scraper_items WHERE data_url = ?", (test_target_url,)).fetchone()
-        if item:
-            print(f"Статус: {item['status']}")
-            print(f"Собранные данные (JSON): \n{item['extracted_data']}")
+                loc = page.locator(sel).first
+                if await loc.count() > 0:
+                    if any(kw in f.lower() for kw in ['website', 'email', 'url', 'link']) and await loc.evaluate("el => el.tagName.toLowerCase() === 'a'"):
+                        href = await loc.get_attribute('href')
+                        res[f] = href.replace('mailto:', '').strip() if href and href.startswith('mailto:') else (href.strip() if href else (await loc.inner_text()).strip())
+                    else: res[f] = (await loc.inner_text()).strip()
+                else: res[f] = None
+            except: res[f] = None
+        return res
