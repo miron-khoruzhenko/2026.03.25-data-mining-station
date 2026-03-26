@@ -82,13 +82,14 @@ class DataScraper:
 
             # --- 3. ПОПЫТКА ИЗВЛЕЧЕНИЯ ДАННЫХ ЧЕРЕЗ API (МГНОВЕННО) ---
             if adapter:
-                # Даем фоновым запросам 1.5 секунды на выполнение
-                await page.wait_for_timeout(1500) 
-                ext_data = adapter.extract_data()
-                
-                if ext_data and any(ext_data.values()):
-                    is_empty = False
-                    self._log(f"[W-{w_id}][⚡] Данные перехвачены через API плагин!", ui_callback)
+                # Умный микро-опрос: проверяем адаптер каждые 150мс (макс 15 итераций = ~2.2 сек)
+                for _ in range(15):
+                    ext_data = adapter.extract_data()
+                    if ext_data and any(ext_data.values()):
+                        is_empty = False
+                        self._log(f"[W-{w_id}][⚡] Данные перехвачены через API плагин!", ui_callback)
+                        break # Выходим мгновенно, как только данные получены
+                    await page.wait_for_timeout(150)
                 
                 # Снимаем слушатель, чтобы не засорять память
                 page.remove_listener("response", adapter.intercept_response)
@@ -142,7 +143,9 @@ class DataScraper:
             self._log(f"[W-{w_id}][+] Готово", ui_callback, {"elapsed": el, "eta": int(avg * remaining_items)})
             
             # Случайная пауза перед следующей ссылкой для имитации человека
-            await asyncio.sleep(random.uniform(2.0, 4.5))
+            # await asyncio.sleep(random.uniform(2.0, 4.5))
+            # Минимальная пауза (0.2 - 0.5 сек) вместо долгих 4 секунд
+            await asyncio.sleep(random.uniform(0.2, 0.5))
 
     # --- ИСПРАВЛЕННАЯ ЛОГИКА РАБОТЫ С КЭШЕМ ---
     def _get_cached_selectors(self, domain):

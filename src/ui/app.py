@@ -5,6 +5,7 @@ import json
 import pandas as pd
 from pathlib import Path
 import os 
+import threading
 
 # Подключение модулей из корня проекта
 PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -238,33 +239,40 @@ with tab1:
     with col_run2:
         st.subheader("Режим 2: Scraper")
         items_to_scrape = st.number_input("Карточек за запуск?", min_value=1, max_value=999999, value=99999)
-        if st.button("▶️ Запустить Scraper", type="primary", width='stretch'):
-            
-            live_timer = st.empty()
-            st.markdown("### 🔄 Лайв статус работы")
-            live_logs = st.empty()
-            log_history = []
-
-            def scraper_callback(msg, stats=None):
-                if msg:
-                    log_history.append(msg)
-                    live_logs.code("\n".join(log_history[-15:]), language="json")
-                if stats:
-                    with live_timer.container():
-                        ct1, ct2 = st.columns(2)
-                        ct1.metric("⏱ Прошло времени", format_time(stats['elapsed']))
-                        ct2.metric("⏳ Осталось примерно", format_time(stats['eta']))
-
-            with st.spinner("Работает... Для экстренной остановки нажми 'Stop' в правом верхнем углу."):
+        
+        # 1. Проверяем все активные потоки сервера
+        is_scraper_running = any(t.name == "ScraperBackgroundThread" for t in threading.enumerate())
+        
+        # 2. Меняем интерфейс в зависимости от статуса
+        if is_scraper_running:
+            st.warning("⏳ Скрейпер в данный момент работает в фоновом режиме.")
+            st.button("▶️ Запустить Scraper", disabled=True, use_container_width=True)
+            st.info("💡 Обновляй страницу (F5), чтобы видеть, как растут счетчики сверху. Вкладку можно безопасно закрыть.")
+        else:
+            if st.button("▶️ Запустить Scraper (в фоне)", type="primary", use_container_width=True):
+                
                 custom_fields = [f.strip() for f in custom_fields_input.split(",") if f.strip()]
-                DataScraper().run(
-                    custom_fields=custom_fields, 
-                    max_items_to_test=items_to_scrape, 
-                    use_only_custom=use_only_custom,
-                    headless=is_headless,
-                    ui_callback=scraper_callback
-                )
-            st.rerun()
+                
+                def background_scraper():
+                    try:
+                        DataScraper().run(
+                            custom_fields=custom_fields, 
+                            max_items_to_test=items_to_scrape, 
+                            use_only_custom=use_only_custom,
+                            headless=is_headless,
+                            ui_callback=None 
+                        )
+                    except Exception as e:
+                        print(f"[!] Ошибка фонового потока: {e}")
+
+                # Создаем поток с УНИКАЛЬНЫМ ИМЕНЕМ
+                thread = threading.Thread(target=background_scraper, name="ScraperBackgroundThread", daemon=True)
+                thread.start()
+                
+                # Даем потоку полсекунды на старт, затем перезагружаем интерфейс для смены кнопки
+                time.sleep(0.5)
+                st.rerun()
+          
             
 with tab2:
     st.subheader("Управление селекторами (ai_configs)")
