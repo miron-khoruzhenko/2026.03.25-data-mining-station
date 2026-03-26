@@ -4,3 +4,5 @@ pandas>=2.2.2
 openpyxl>=3.1.2
 streamlit>=1.32.2
 dotenv
+requests
+pyTelegramBotAPI
