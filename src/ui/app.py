@@ -220,7 +220,7 @@ with tab1:
     
     with col_run1:
         st.subheader("Режим 1: Crawler")
-        pages_to_crawl = st.number_input("Страниц пагинации за запуск?", 1, 1000, 5)
+        pages_to_crawl = st.number_input("Страниц пагинации за запуск?", min_value=1, max_value=999999, value=99999)
         if st.button("▶️ Запустить Crawler", type="primary", width='stretch'):
             st.markdown("### 🔄 Лайв статус работы")
             live_logs = st.empty()
@@ -237,7 +237,7 @@ with tab1:
 
     with col_run2:
         st.subheader("Режим 2: Scraper")
-        items_to_scrape = st.number_input("Карточек за запуск?", 1, 1000, 10)
+        items_to_scrape = st.number_input("Карточек за запуск?", min_value=1, max_value=999999, value=99999)
         if st.button("▶️ Запустить Scraper", type="primary", width='stretch'):
             
             live_timer = st.empty()
