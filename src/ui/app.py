@@ -20,9 +20,14 @@ st.set_page_config(page_title="Strewen - AI Data Miner", page_icon="⛏️", lay
 
 # ================= ЭКРАН АВТОРИЗАЦИИ =================
 def check_password():
-    """Возвращает True, если введен правильный пароль."""
+    """Возвращает True, если введен правильный пароль. Выживает при F5."""
     CORRECT_PASSWORD = "135531"
 
+    # 1. Проверяем URL на наличие флага (спасает при нажатии F5)
+    if st.query_params.get("auth") == "1":
+        return True
+
+    # 2. Проверяем обычную сессию
     if st.session_state.get("password_correct", False):
         return True
 
@@ -36,9 +41,11 @@ def check_password():
             
             pwd = st.text_input("Пароль", type="password", label_visibility="collapsed", placeholder="Введите пароль...")
             
-            if st.form_submit_button("Войти в систему", type="primary", width='stretch'):
+            if st.form_submit_button("Войти в систему", type="primary", use_container_width=True):
                 if pwd == CORRECT_PASSWORD:
                     st.session_state["password_correct"] = True
+                    # Сохраняем "пропуск" в URL браузера
+                    st.query_params["auth"] = "1" 
                     st.rerun()
                 else:
                     st.error("❌ Неверный пароль")
@@ -240,18 +247,62 @@ with tab1:
         st.subheader("Режим 2: Scraper")
         items_to_scrape = st.number_input("Карточек за запуск?", min_value=1, max_value=999999, value=99999)
         
-        # 1. Проверяем все активные потоки сервера
+        # Файл-посредник для общения между фоновым потоком и UI
+        STATE_FILE = PROJECT_ROOT / "data" / "scraper_state.json"
+        
         is_scraper_running = any(t.name == "ScraperBackgroundThread" for t in threading.enumerate())
         
-        # 2. Меняем интерфейс в зависимости от статуса
         if is_scraper_running:
             st.warning("⏳ Скрейпер в данный момент работает в фоновом режиме.")
+            
+            # --- ЧТЕНИЕ ЛАЙВ-СТАТУСА ИЗ ФАЙЛА ---
+            if STATE_FILE.exists():
+                try:
+                    with open(STATE_FILE, "r", encoding="utf-8") as f:
+                        state_data = json.load(f)
+                    
+                    if "stats" in state_data and state_data["stats"]:
+                        ct1, ct2 = st.columns(2)
+                        ct1.metric("⏱ Прошло времени", format_time(state_data["stats"].get("elapsed", 0)))
+                        ct2.metric("⏳ Осталось примерно", format_time(state_data["stats"].get("eta", 0)))
+                    
+                    if "last_msg" in state_data:
+                        st.code(state_data["last_msg"], language="text")
+                except Exception:
+                    pass # Игнорируем ошибки чтения (если поток записывает файл прямо в эту миллисекунду)
+
+            st.markdown("ℹ️ *Лайв-логи в UI отключены для стабильности. Прогресс можно смотреть в верхних карточках, обновляя страницу (F5), а полные логи — через `docker compose logs -f` в терминале VPS.*")
+            
+            # Мягкая кнопка обновления (без жесткого F5)
+            if st.button("🔄 Обновить статус UI", use_container_width=True):
+                st.rerun()
+                
             st.button("▶️ Запустить Scraper", disabled=True, use_container_width=True)
-            st.info("💡 Обновляй страницу (F5), чтобы видеть, как растут счетчики сверху. Вкладку можно безопасно закрыть.")
+            
         else:
             if st.button("▶️ Запустить Scraper (в фоне)", type="primary", use_container_width=True):
                 
+                # Очищаем старый файл статуса перед новым запуском
+                if STATE_FILE.exists():
+                    STATE_FILE.unlink()
+                
                 custom_fields = [f.strip() for f in custom_fields_input.split(",") if f.strip()]
+                
+                # Функция-шпион: пишет статусы на диск, не ломая интерфейс
+                def background_callback(msg, stats=None):
+                    try:
+                        current_state = {}
+                        if STATE_FILE.exists():
+                            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                                current_state = json.load(f)
+                        
+                        if msg: current_state["last_msg"] = msg
+                        if stats: current_state["stats"] = stats
+                        
+                        with open(STATE_FILE, "w", encoding="utf-8") as f:
+                            json.dump(current_state, f, ensure_ascii=False)
+                    except Exception:
+                        pass
                 
                 def background_scraper():
                     try:
@@ -260,16 +311,14 @@ with tab1:
                             max_items_to_test=items_to_scrape, 
                             use_only_custom=use_only_custom,
                             headless=is_headless,
-                            ui_callback=None 
+                            ui_callback=background_callback # <-- Передаем нашего шпиона
                         )
                     except Exception as e:
                         print(f"[!] Ошибка фонового потока: {e}")
 
-                # Создаем поток с УНИКАЛЬНЫМ ИМЕНЕМ
                 thread = threading.Thread(target=background_scraper, name="ScraperBackgroundThread", daemon=True)
                 thread.start()
                 
-                # Даем потоку полсекунды на старт, затем перезагружаем интерфейс для смены кнопки
                 time.sleep(0.5)
                 st.rerun()
           
